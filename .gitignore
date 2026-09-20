@@ -20,7 +20,7 @@ data/processed/*.csv
 reports/*.png
 
 # Keep the directory structure, the bundled dataset and the example files in git
-!data/raw/epl_players_2024_25.csv
+!data/raw/epl_players_2026_27.csv
 !data/raw/market_values.example.csv
 !**/.gitkeep
 

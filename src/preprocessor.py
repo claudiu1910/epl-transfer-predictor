@@ -18,6 +18,8 @@ from sklearn.preprocessing import OneHotEncoder, StandardScaler
 
 from .data_loader import (
     AGE_RANGE,
+    COMPETITIONS,
+    DEFAULT_COMPETITION_LABEL,
     ASSISTS_RANGE,
     GOALS_RANGE,
     MINUTES_RANGE,
@@ -60,7 +62,7 @@ NUMERIC_FEATURES: tuple[str, ...] = (
     "assists_per_90",
     "years_from_peak_sq",
 )
-CATEGORICAL_FEATURES: tuple[str, ...] = ("position",)
+CATEGORICAL_FEATURES: tuple[str, ...] = ("position", "stats_competition")
 FEATURE_COLUMNS: tuple[str, ...] = NUMERIC_FEATURES + CATEGORICAL_FEATURES
 
 #: Columns carried alongside the features for display in the dashboard.
@@ -71,6 +73,10 @@ IDENTITY_COLUMNS: tuple[str, ...] = ("player_name", "team", "position")
 #: sits between the extremes, which makes "vs MF" the most readable baseline.
 REFERENCE_POSITION = "MF"
 _ENCODER_CATEGORIES = [REFERENCE_POSITION] + [p for p in POSITIONS if p != REFERENCE_POSITION]
+#: Top flight is the reference level, so the Championship bar reads as a discount.
+_COMPETITION_CATEGORIES = [DEFAULT_COMPETITION_LABEL] + [
+    c for c in COMPETITIONS if c != DEFAULT_COMPETITION_LABEL
+]
 
 #: Minimum 90s used as a per-90 denominator, so a 12-minute cameo with one goal
 #: does not turn into 7.5 goals per 90.
@@ -113,6 +119,16 @@ def clean_players(frame: pd.DataFrame, require_target: bool = True) -> pd.DataFr
     if "position" not in data.columns:
         data["position"] = "MF"
     data["position"] = data["position"].map(normalise_position).astype("string")
+
+    # Anything not explicitly flagged is treated as top-flight output.
+    if "stats_competition" not in data.columns:
+        data["stats_competition"] = DEFAULT_COMPETITION_LABEL
+    data["stats_competition"] = (
+        data["stats_competition"]
+        .fillna(DEFAULT_COMPETITION_LABEL)
+        .where(lambda s: s.isin(COMPETITIONS), DEFAULT_COMPETITION_LABEL)
+        .astype("string")
+    )
 
     # Numerics: coerce, then fill. Age falls back to the squad median because
     # a zero would be nonsense; counting stats legitimately default to zero.
@@ -186,6 +202,7 @@ def make_player_frame(
     assists: float,
     minutes_played: float,
     position: str,
+    stats_competition: str = DEFAULT_COMPETITION_LABEL,
 ) -> pd.DataFrame:
     """Build a single-row, fully engineered feature frame for inference.
 
@@ -201,6 +218,7 @@ def make_player_frame(
                 "assists": assists,
                 "minutes_played": minutes_played,
                 "position": normalise_position(position),
+                "stats_competition": stats_competition,
             }
         ]
     )
@@ -223,8 +241,8 @@ def build_preprocessor() -> ColumnTransformer:
             (
                 "categorical",
                 OneHotEncoder(
-                    categories=[_ENCODER_CATEGORIES],
-                    drop="first",  # REFERENCE_POSITION becomes the baseline
+                    categories=[_ENCODER_CATEGORIES, _COMPETITION_CATEGORIES],
+                    drop="first",  # REFERENCE_POSITION / Premier League are the baselines
                     sparse_output=False,
                 ),
                 list(CATEGORICAL_FEATURES),
@@ -279,6 +297,8 @@ def humanise_feature_names(names: Sequence[str]) -> list[str]:
             labels.append(pretty[name])
         elif name.startswith("position_"):
             labels.append(f"Position: {name.split('_', 1)[1]} (vs {REFERENCE_POSITION})")
+        elif name.startswith("stats_competition_"):
+            labels.append(f"Stats from the {name.split('stats_competition_', 1)[1]}")
         else:
             labels.append(name.replace("_", " ").capitalize())
     return labels

@@ -6,7 +6,8 @@ worth. Players the model prices *above* the market are scouting targets;
 players it prices *below* are where the market is paying for something the
 stats cannot see.
 
-Runs offline with no API key.
+Runs offline with no API key, but **the live API is the accurate path** — see
+[The dataset](#the-dataset) for why.
 
 ---
 
@@ -16,9 +17,12 @@ Runs offline with no API key.
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 
-python train.py            # trains on 224 real players across all 20 clubs
+python train.py            # trains on 279 real players across all 20 clubs
 streamlit run app.py       # open the dashboard
 ```
+
+`train.py` uses the live API when `FOOTBALL_DATA_API_KEY` is set and falls back
+to the bundled snapshot (with a warning) when it is not.
 
 `train.py` writes `models/model.pkl`, `models/metadata.json`, the league-wide
 `data/processed/scout_table.csv` and diagnostic PNGs in `reports/`. The
@@ -59,28 +63,53 @@ scatter with the y = x line, and a residual plot.
 
 ## The dataset
 
-The bundled dataset covers **224 players across all 20 clubs** of the 2024/25
+The bundled snapshot covers **279 players across all 20 clubs** of the 2026/27
 Premier League season, with the columns the pipeline expects:
 
 ```
 player_name, team, position, age, minutes_played, goals, assists, actual_market_value_eur
 ```
 
-It lives at [`data/raw/epl_players_2024_25.csv`](data/raw/epl_players_2024_25.csv),
+It lives at [`data/raw/epl_players_2026_27.csv`](data/raw/epl_players_2026_27.csv),
 generated from the table in [`src/reference_data.py`](src/reference_data.py) and
 regenerated automatically if you delete it.
 
-> ### Read this before trusting a number
+> ### What is verified and what is not
 >
-> **Player names, clubs and positions are real. Ages, appearance statistics and
-> market values are approximate reference figures** compiled from public
-> reporting of the 2024/25 season. They are not scraped from Transfermarkt,
-> they are not an authoritative feed, and they will not match any official
-> source row for row.
+> **Verified by research (September 2026):**
 >
-> They exist so the dashboard is immediately usable with recognisable players
-> instead of invented ones. The CSV is the editable surface — correct a value
-> there and it survives the next run.
+> * The 20 clubs in the 2026/27 season. Coventry City, Hull City and Ipswich
+>   Town came up; Burnley, West Ham United and Wolverhampton Wanderers went down.
+> * Squad membership after the summer 2026 window — Enzo Fernández at
+>   Manchester City, Bernardo Silva and Rodri gone, Bruno Guimarães at Arsenal,
+>   Morgan Rogers at Chelsea, Carlos Baleba at Manchester United.
+>
+> **Approximate, and not to be relied on:**
+>
+> * Ages (correct to within about a year).
+> * Appearance statistics, which are prior-season (2025/26) figures.
+> * Market values, which are rough September 2026 numbers.
+>
+> A market value is also **not a transfer fee**. Enzo Fernández is carried here
+> at €130M; he moved for £125m, and the two figures measure different things —
+> a fee reflects contract length, buyer competition and timing.
+>
+> **Any hand-maintained squad list goes stale at the next transfer window.**
+> That is not a caveat to work around, it is the reason `--mode api` exists.
+> The snapshot is the offline fallback, not the source of truth.
+
+### Two stat vintages, on purpose
+
+Squads are current; statistics are from the **last completed season (2025/26)**,
+because the current campaign is only a handful of matchweeks old and nobody has
+a meaningful sample yet. That split is standard for scouting data, and the
+dashboard labels both vintages.
+
+Players at the promoted clubs posted those numbers in the **Championship**, so
+the dataset carries a `stats_competition` column and the model uses it as a
+feature. Without it every promoted-club player reads as a screaming bargain:
+before the fix, the entire top three of the bargains table was Coventry and
+Hull players. Adding it lifted cross-validated R² from 0.48 to 0.67.
 
 ### Using your own valuations
 
@@ -98,8 +127,10 @@ Players the CSV does not cover are dropped by default; pass
 `--on-missing synthesise` to fill the gaps instead (those rows are flagged in
 `value_source`).
 
-### Using live statistics
+### Using live data (recommended)
 
+`/competitions/PL/teams` returns **today's** squads, so club, position and age
+stay correct through every transfer window without anyone hand-editing a CSV.
 Get a free key at [football-data.org](https://www.football-data.org/client/register):
 
 ```bash
@@ -107,8 +138,9 @@ export FOOTBALL_DATA_API_KEY=your_key_here
 python train.py --mode api
 ```
 
-This pulls live squads and scoring statistics and joins valuations from the
-bundled CSV, because no free API publishes transfer fees.
+`--mode auto` (the default) picks this automatically whenever the key is set.
+Valuations still come from `--market-values` or the bundled CSV, because no free
+API publishes transfer fees.
 
 **Rate limiting.** The free tier allows 10 requests per minute. `RateLimiter`
 in [`src/data_loader.py`](src/data_loader.py) enforces this with a sliding
@@ -148,6 +180,7 @@ from 0.33 to 0.42.
 | `goals_per_90`, `assists_per_90` | Rate stats: separates an efficient substitute from a goalless ever-present |
 | `years_from_peak_sq` | `(age − 25.5)²`, letting a *linear* model bend the age curve |
 | `position` | One-hot encoded, midfielder as the reference category |
+| `stats_competition` | Premier League vs Championship, so promoted clubs' output is discounted rather than taken at face value |
 
 Raw `goals` and `assists` are deliberately **excluded**: they correlate ~0.9
 with their own per-90 rates, and feeding both makes the two split the credit so
@@ -159,16 +192,16 @@ and assists as inputs — they flow through the per-90 rates.
 
 ## Metrics
 
-A representative run on the bundled dataset (224 players, 80/20 split):
+A representative run on the bundled dataset (279 players, 80/20 split):
 
 ```
-Train  R2 =  0.460 | MAE = EUR 13.28M | RMSE = EUR 18.99M
-Test   R2 =  0.558 | MAE = EUR 11.19M | RMSE = EUR 15.45M
-5-fold CV R2 = 0.415 (+/- 0.113)
+Train  R2 =  0.703 | MAE = EUR  8.26M | RMSE = EUR 11.52M
+Test   R2 =  0.705 | MAE = EUR 13.88M | RMSE = EUR 19.54M
+5-fold CV R2 = 0.670 (+/- 0.128)
 ```
 
-An R² around 0.5 is roughly what four performance statistics can honestly
-explain about transfer values. On synthetic data (`--mock`) the same pipeline
+An R² around 0.7 is about what these statistics can honestly explain about
+transfer values. On synthetic data (`--mock`) the same pipeline
 scores R² 0.89 — a useful reminder that a strong score on generated data
 measures the code, not the market.
 
@@ -180,7 +213,7 @@ measures the code, not the market.
 epl-transfer-predictor/
 ├── data/
 │   ├── raw/
-│   │   ├── epl_players_2024_25.csv   # the bundled dataset
+│   │   ├── epl_players_2026_27.csv   # the bundled dataset
 │   │   └── market_values.example.csv # schema for your own valuations
 │   └── processed/                    # cleaned dataset, predictions, scout table
 ├── models/                           # model.pkl + metadata.json (git-ignored)
@@ -239,7 +272,11 @@ Worth being blunt about, since the dashboard produces confident-looking numbers:
 * **Real fees are driven by things absent from the feature set** — contract
   length, injury history, release clauses, agent fees, selling-club leverage
   and buyer desperation.
-* **The bundled figures are approximate.** See the dataset note above.
+* **The bundled figures are approximate and hand-maintained.** Squads go stale
+  at every transfer window; `--mode api` is the only path that tracks current
+  rosters without someone editing a CSV. See the dataset note above.
+* **Statistics and squads are from different dates** — 2025/26 output, 2026/27
+  clubs. A player who moved in the summer carries his old club's numbers.
 
 ## Licence
 

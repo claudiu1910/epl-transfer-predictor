@@ -35,7 +35,7 @@ import numpy as np
 import pandas as pd
 import requests
 
-from .reference_data import EPL_SQUADS, PROVENANCE, SEASON, SQUAD_FIELDS
+from .reference_data import EPL_SQUADS, PROMOTED_CLUBS, PROVENANCE, SEASON, SQUAD_FIELDS
 
 LOGGER = logging.getLogger(__name__)
 
@@ -62,7 +62,14 @@ PLAYER_COLUMNS: tuple[str, ...] = (
     "goals",
     "assists",
     "matches",
+    "stats_competition",
 )
+
+#: Which competition a player's statistics were posted in. Promoted clubs bring
+#: Championship numbers, and a goal there is not worth a goal in the Premier
+#: League - without this the model reads every promoted-club player as a bargain.
+COMPETITIONS: tuple[str, ...] = ("Premier League", "Championship")
+DEFAULT_COMPETITION_LABEL = "Premier League"
 
 #: Target in full euros (the column the dashboard displays).
 TARGET_EUR = "actual_market_value_eur"
@@ -70,7 +77,7 @@ TARGET_EUR = "actual_market_value_eur"
 TARGET_EUR_M = "market_value_eur_m"
 
 #: Where :func:`build_reference_dataset` writes the curated CSV.
-REFERENCE_DATASET_PATH = Path("data/raw/epl_players_2024_25.csv")
+REFERENCE_DATASET_PATH = Path("data/raw/epl_players_2026_27.csv")
 
 # The API does not publish per-player minutes on the free tier, so minutes are
 # estimated from appearances. Kept explicit (and documented in the README) so
@@ -317,6 +324,9 @@ def build_reference_dataset(path: str | Path = REFERENCE_DATASET_PATH) -> Path:
     frame["matches"] = np.round(frame["minutes_played"] / MINUTES_PER_APPEARANCE_ESTIMATE).astype(int)
     frame[TARGET_EUR] = (frame.pop(TARGET_EUR_M) * 1_000_000).astype("int64")
     frame["season"] = SEASON
+    frame["stats_competition"] = np.where(
+        frame["team"].isin(PROMOTED_CLUBS), "Championship", DEFAULT_COMPETITION_LABEL
+    )
     frame["value_source"] = "reference"
 
     destination = Path(path)
@@ -452,6 +462,7 @@ def fetch_epl_players(
         merged[column] = pd.to_numeric(merged[column], errors="coerce").fillna(default).astype(int)
 
     merged["position"] = merged["position"].map(normalise_position)
+    merged["stats_competition"] = DEFAULT_COMPETITION_LABEL
     merged = merged.dropna(subset=["player_name"])
 
     LOGGER.info("Fetched %d players from the API", len(merged))
@@ -524,6 +535,7 @@ def generate_mock_players(n_players: int = 320, seed: int | None = 42) -> pd.Dat
             "goals": goals.astype(int),
             "assists": assists.astype(int),
             "matches": matches,
+            "stats_competition": DEFAULT_COMPETITION_LABEL,
         }
     )
     LOGGER.info("Generated %d mock players (seed=%s)", len(frame), seed)
@@ -716,16 +728,30 @@ def load_dataset(
     """Load features and target in one call.
 
     Modes:
-        ``reference`` - the bundled 2024/25 dataset of real players (default).
-        ``api``       - live football-data.org statistics; valuations come from
-                        ``market_value_csv``, falling back to the reference CSV
-                        because no free API publishes transfer fees.
+        ``api``       - live football-data.org squads and statistics. This is
+                        the only source that tracks the *current* season, so it
+                        is what ``auto`` picks whenever an API key is present.
+                        Valuations come from ``market_value_csv``, falling back
+                        to the bundled CSV, because no free API publishes fees.
+        ``reference`` - the bundled snapshot of real players. Offline and
+                        instant, but frozen: squads go stale every transfer
+                        window.
         ``mock``      - synthetic players and synthetic valuations.
-        ``auto``      - resolves to ``reference``.
+        ``auto``      - ``api`` when an API key is set, otherwise ``reference``.
     """
-    resolved: str = "reference" if mode == "auto" else mode
+    resolved: str = mode
     if mode == "auto":
-        LOGGER.info("mode=auto resolved to 'reference'")
+        if api_key or os.getenv(API_KEY_ENV_VAR):
+            resolved = "api"
+            LOGGER.info("mode=auto resolved to 'api' (%s is set)", API_KEY_ENV_VAR)
+        else:
+            resolved = "reference"
+            LOGGER.warning(
+                "mode=auto resolved to 'reference': %s is not set. The bundled dataset "
+                "is a frozen snapshot - squads will not reflect recent transfers. Set an "
+                "API key for current rosters.",
+                API_KEY_ENV_VAR,
+            )
 
     if resolved == "reference":
         dataset = load_reference_dataset(reference_path)
@@ -744,9 +770,21 @@ def load_dataset(
         return dataset
 
     if resolved == "api":
-        players = fetch_epl_players(
-            api_key=api_key, scorer_limit=scorer_limit, include_non_scorers=include_non_scorers
-        )
+        try:
+            players = fetch_epl_players(
+                api_key=api_key, scorer_limit=scorer_limit, include_non_scorers=include_non_scorers
+            )
+        except (MissingAPIKeyError, requests.RequestException, RuntimeError):
+            if mode == "api":  # explicitly requested - do not silently degrade
+                raise
+            LOGGER.warning("Live pull failed; falling back to the bundled snapshot")
+            return load_dataset(
+                mode="reference",
+                market_value_csv=market_value_csv,
+                reference_path=reference_path,
+                seed=seed,
+                on_missing=on_missing,
+            )
         # The API has no transfer fees, so fall back to the bundled valuations.
         values_csv = market_value_csv
         if values_csv is None:

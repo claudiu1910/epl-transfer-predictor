@@ -38,7 +38,7 @@ from src.model import (
     scout_table,
 )
 from src.preprocessor import MIN_NINETIES, REFERENCE_POSITION, TARGET
-from src.reference_data import PROVENANCE, SEASON
+from src.reference_data import PROVENANCE, SEASON, SNAPSHOT_NOTICE, SQUAD_AS_OF, STATS_SEASON
 from src.visualize import plot_actual_vs_predicted, plot_coefficients, plot_residuals
 
 PROCESSED_DATASET_PATH = Path("data/processed/players_processed.csv")
@@ -153,6 +153,9 @@ test_predictions = get_predictions()
 # One vectorised pass over the league: actual vs predicted vs delta.
 league = scout_table(pipeline, dataset).sort_values("player_name").reset_index(drop=True)
 
+if metadata.get("target_source") == "reference":
+    st.warning(SNAPSHOT_NOTICE, icon=":material/history:")
+
 
 # --------------------------------------------------------------------------- #
 # Sidebar: club -> player selection
@@ -178,13 +181,17 @@ with st.sidebar:
 
     st.divider()
     st.caption(
-        f"**Season:** {SEASON}  \n"
+        f"**Squads:** {SEASON}, checked {SQUAD_AS_OF}  \n"
+        f"**Statistics:** {STATS_SEASON} season  \n"
         f"**Players:** {len(league)} across {league['team'].nunique()} clubs  \n"
         f"**Data source:** {metadata.get('data_source', 'unknown')}  \n"
         f"**Trained:** {metadata.get('trained_at', 'unknown')}"
     )
     if metadata.get("target_source") == "reference":
-        st.caption(f":warning: {PROVENANCE}. Swap in a real export before relying on a number.")
+        st.caption(
+            f":warning: {PROVENANCE}. For current squads run `train.py --mode api`; "
+            "for real valuations pass `--market-values`."
+        )
 
 player = league[league["player_name"] == player_name].iloc[0]
 
@@ -204,7 +211,8 @@ st.markdown(
       <div class="name">{html.escape(str(player['player_name']))}</div>
       <div class="meta">{html.escape(str(player['team']))} &nbsp;&middot;&nbsp;
         {POSITION_LABELS.get(player['position'], player['position'])} &nbsp;&middot;&nbsp;
-        {int(player['age'])} years old</div>
+        {int(player['age'])} years old
+        &nbsp;&middot;&nbsp; <span style="color:#8a949e">{html.escape(STATS_SEASON)} stats</span></div>
       <div class="stats">
         <span class="chip">Minutes <b>{minutes:,.0f}</b></span>
         <span class="chip">Goals <b>{goals}</b></span>
@@ -255,7 +263,7 @@ st.caption(
 # --------------------------------------------------------------------------- #
 with st.expander("Simulate performance change", expanded=False):
     st.markdown(
-        f"Sliders start at {player['player_name']}'s real {SEASON} numbers. "
+        f"Sliders start at {player['player_name']}'s {STATS_SEASON} numbers. "
         "Move them to see how the valuation responds - *what if he scored five more?*"
     )
 

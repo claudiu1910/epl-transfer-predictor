@@ -174,6 +174,7 @@ def predict_value(
     assists: float,
     minutes_played: float,
     position: str,
+    stats_competition: str = "Premier League",
     clip_negative: bool = True,
 ) -> float:
     """Predict one player's transfer value, in EUR millions.
@@ -184,7 +185,7 @@ def predict_value(
     result at zero; pass ``False`` to see the raw fit, which is how the
     dashboard detects that a prediction was clipped and says so.
     """
-    features = make_player_frame(age, goals, assists, minutes_played, position)
+    features = make_player_frame(age, goals, assists, minutes_played, position, stats_competition)
     prediction = float(pipeline.predict(features)[0])
     return max(prediction, 0.0) if clip_negative else prediction
 
