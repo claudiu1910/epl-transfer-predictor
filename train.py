@@ -1,20 +1,24 @@
 #!/usr/bin/env python3
-"""Train the EPL transfer-value model and save the pipeline for the dashboard.
+"""Train the transfer-value model and save the pipeline for the scouting dashboard.
 
 Examples
 --------
-Offline, zero configuration (synthetic players and valuations)::
+Default: the bundled 2024/25 dataset of real Premier League players::
 
-    python train.py --mock
+    python train.py
 
-Live Premier League statistics, synthetic valuation baseline::
+Live statistics from football-data.org, valuations from the bundled dataset::
 
     export FOOTBALL_DATA_API_KEY=...
     python train.py --mode api
 
-Live statistics joined against your own market-value CSV::
+Your own market-value export, joined on player name::
 
-    python train.py --mode api --market-values data/raw/market_values.csv
+    python train.py --market-values data/raw/my_values.csv
+
+Synthetic players, for testing the pipeline without real names::
+
+    python train.py --mock
 """
 
 from __future__ import annotations
@@ -26,7 +30,13 @@ from pathlib import Path
 
 import pandas as pd
 
-from src.data_loader import API_KEY_ENV_VAR, MissingAPIKeyError, load_dataset
+from src.data_loader import (
+    API_KEY_ENV_VAR,
+    REFERENCE_DATASET_PATH,
+    TARGET_EUR,
+    MissingAPIKeyError,
+    load_dataset,
+)
 from src.model import (
     DEFAULT_METADATA_PATH,
     DEFAULT_MODEL_PATH,
@@ -37,18 +47,26 @@ from src.model import (
     format_metrics,
     get_coefficients,
     get_intercept,
+    scout_table,
     save_metadata,
     save_model,
     save_test_predictions,
     train_model,
 )
-from src.preprocessor import FEATURE_COLUMNS, TARGET, prepare_dataset, split_dataset
+from src.preprocessor import (
+    FEATURE_COLUMNS,
+    IDENTITY_COLUMNS,
+    TARGET,
+    prepare_dataset,
+    split_dataset,
+)
 from src.visualize import REPORTS_DIR, save_diagnostic_figures
 
 LOGGER = logging.getLogger("train")
 
 RAW_DATASET_PATH = Path("data/raw/players_raw.csv")
 PROCESSED_DATASET_PATH = Path("data/processed/players_processed.csv")
+SCOUT_TABLE_PATH = Path("data/processed/scout_table.csv")
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -60,15 +78,27 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     source = parser.add_argument_group("data source")
     source.add_argument(
         "--mode",
-        choices=("auto", "api", "mock"),
+        choices=("auto", "reference", "api", "mock"),
         default="auto",
-        help="'api' pulls football-data.org, 'mock' generates offline data, "
-        "'auto' picks the API when an API key is present.",
+        help="'reference' uses the bundled dataset of real Premier League players, "
+        "'api' pulls live stats from football-data.org, 'mock' generates synthetic "
+        "players. 'auto' resolves to 'reference'.",
     )
     source.add_argument(
         "--mock",
         action="store_true",
-        help="Shorthand for --mode mock; runs the whole pipeline with no API key.",
+        help="Shorthand for --mode mock; synthetic players instead of real ones.",
+    )
+    source.add_argument(
+        "--reference-path",
+        type=Path,
+        default=REFERENCE_DATASET_PATH,
+        help="CSV holding the curated dataset; generated on first use.",
+    )
+    source.add_argument(
+        "--rebuild-reference",
+        action="store_true",
+        help="Overwrite the reference CSV from src/reference_data.py before training.",
     )
     source.add_argument("--n-mock", type=int, default=320, help="Players to generate in mock mode.")
     source.add_argument(
@@ -127,10 +157,17 @@ def main(argv: list[str] | None = None) -> int:
 
     # -- 1. Load ------------------------------------------------------------ #
     _banner("1. Loading data")
+    if args.rebuild_reference:
+        from src.data_loader import build_reference_dataset
+
+        build_reference_dataset(args.reference_path)
+        print(f"Rebuilt reference dataset -> {args.reference_path}")
+
     try:
         raw = load_dataset(
             mode=args.mode,
             market_value_csv=args.market_values,
+            reference_path=args.reference_path,
             n_mock=args.n_mock,
             seed=args.random_state,
             scorer_limit=args.scorer_limit,
@@ -139,11 +176,19 @@ def main(argv: list[str] | None = None) -> int:
         )
     except MissingAPIKeyError as exc:
         print(f"\nERROR: {exc}\n", file=sys.stderr)
-        print(f"Set {API_KEY_ENV_VAR} or re-run with --mock.", file=sys.stderr)
+        print(
+            f"Set {API_KEY_ENV_VAR}, or use the bundled dataset with --mode reference.",
+            file=sys.stderr,
+        )
         return 2
 
     data_source = raw.attrs.get("source", args.mode)
-    target_source = "csv" if args.market_values else "synthetic"
+    if args.market_values:
+        target_source = "csv"
+    elif data_source == "mock":
+        target_source = "synthetic"
+    else:
+        target_source = "reference"
     print(f"Loaded {len(raw)} players (source: {data_source}, target: {target_source})")
 
     if raw.empty:
@@ -161,6 +206,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"Features: {', '.join(FEATURE_COLUMNS)}")
     print("\nPosition mix:")
     print(dataset["position"].value_counts().to_string())
+    print("\nClubs represented:", dataset["team"].nunique())
     print(f"\nTarget ({TARGET}, EUR millions):")
     print(dataset[TARGET].describe().round(2).to_string())
 
@@ -204,12 +250,12 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     coefficients = get_coefficients(pipeline)
-    print(f"\nIntercept: EUR {get_intercept(pipeline):.2f}M")
-    print("\nStandardised coefficients (EUR millions per std. dev.):")
+    print(f"\nBaseline (average midfielder): EUR {get_intercept(pipeline):.2f}M")
+    print("\nStandardised effects (change in value per std. dev. of each feature):")
     print(
-        coefficients[["label", "coefficient"]]
-        .rename(columns={"label": "feature", "coefficient": "coef"})
-        .to_string(index=False, float_format=lambda v: f"{v:+.3f}")
+        coefficients[["label", "pct_per_sd"]]
+        .rename(columns={"label": "feature", "pct_per_sd": "pct_change"})
+        .to_string(index=False, float_format=lambda v: f"{v:+.1f}%")
     )
 
     # -- 5. Persist ------------------------------------------------------------ #
@@ -220,6 +266,36 @@ def main(argv: list[str] | None = None) -> int:
     y_pred_test = pipeline.predict(X_test[list(FEATURE_COLUMNS)])
     save_test_predictions(y_test, y_pred_test, args.predictions_path)
     print(f"Test set  -> {args.predictions_path}")
+
+    # League-wide valuation comparison, ready for the dashboard's scout tab.
+    scouting = scout_table(pipeline, dataset)
+    scouting_columns = [
+        *IDENTITY_COLUMNS,
+        "age",
+        "minutes_played",
+        "goals",
+        "assists",
+        TARGET,
+        TARGET_EUR,
+        "predicted_value_eur_m",
+        "delta_eur_m",
+        "delta_pct",
+        "verdict",
+    ]
+    SCOUT_TABLE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    scouting[scouting_columns].to_csv(SCOUT_TABLE_PATH, index=False)
+    print(f"Scout tbl -> {SCOUT_TABLE_PATH}")
+
+    bargains = scouting.nsmallest(3, "delta_eur_m")
+    premiums = scouting.nlargest(3, "delta_eur_m")
+    print("\nBiggest model-vs-market gaps:")
+    for label, rows in (("bargain (undervalued)", bargains), ("premium (overvalued)", premiums)):
+        for _, row in rows.iterrows():
+            print(
+                f"  {label:22} {row['player_name']:<24} "
+                f"market EUR {row[TARGET]:6.1f}M | model EUR {row['predicted_value_eur_m']:6.1f}M "
+                f"({row['delta_eur_m']:+.1f}M)"
+            )
 
     metadata = build_metadata(
         train_metrics=train_metrics,
@@ -241,7 +317,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Figures   -> {', '.join(str(p) for p in written)}")
 
     _banner("Done")
-    print("Launch the dashboard with:  streamlit run app.py")
+    print("Launch the scouting dashboard with:  streamlit run app.py")
     return 0
 
 

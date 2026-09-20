@@ -20,10 +20,11 @@ from .data_loader import (
     AGE_RANGE,
     ASSISTS_RANGE,
     GOALS_RANGE,
-    MAX_SEASON_MINUTES,
     MINUTES_RANGE,
     PEAK_AGE,
     POSITIONS,
+    TARGET_EUR,
+    TARGET_EUR_M,
     normalise_position,
 )
 
@@ -32,26 +33,43 @@ LOGGER = logging.getLogger(__name__)
 # --------------------------------------------------------------------------- #
 # Feature contract
 # --------------------------------------------------------------------------- #
-TARGET = "market_value_eur_m"
+TARGET = TARGET_EUR_M
 
-#: Straight from the data source (and from the dashboard sliders).
-RAW_NUMERIC_FEATURES: tuple[str, ...] = ("age", "goals", "assists", "minutes")
+#: What a data source supplies and what the what-if sliders control.
+RAW_NUMERIC_FEATURES: tuple[str, ...] = ("age", "goals", "assists", "minutes_played")
 
-#: Derived in :func:`engineer_features`.  All of them are computable from the
-#: raw four, so the dashboard never needs inputs the user cannot provide.
+#: Derived in :func:`engineer_features`, all computable from the raw four.
 ENGINEERED_FEATURES: tuple[str, ...] = (
     "goals_per_90",
     "assists_per_90",
     "years_from_peak_sq",
 )
 
-NUMERIC_FEATURES: tuple[str, ...] = RAW_NUMERIC_FEATURES + ENGINEERED_FEATURES
+#: Features the model actually sees.
+#:
+#: Raw ``goals``/``assists`` are deliberately excluded: they correlate ~0.9 with
+#: their own per-90 rates, and feeding both makes the two split the credit so
+#: neither coefficient can be read on its own. Volume is still represented,
+#: because rate x ``minutes_played`` reconstructs it. Cross-validated R^2 is
+#: slightly *better* without them (0.44 vs 0.42) and the coefficients become
+#: readable, which is the whole point of the Feature Impact tab.
+NUMERIC_FEATURES: tuple[str, ...] = (
+    "age",
+    "minutes_played",
+    "goals_per_90",
+    "assists_per_90",
+    "years_from_peak_sq",
+)
 CATEGORICAL_FEATURES: tuple[str, ...] = ("position",)
 FEATURE_COLUMNS: tuple[str, ...] = NUMERIC_FEATURES + CATEGORICAL_FEATURES
 
+#: Columns carried alongside the features for display in the dashboard.
+IDENTITY_COLUMNS: tuple[str, ...] = ("player_name", "team", "position")
+
 #: Reference category for the one-hot encoder; coefficients read as a premium
-#: (or discount) relative to this position.
-REFERENCE_POSITION = "GK"
+#: (or discount) relative to this position. Midfield is the modal position and
+#: sits between the extremes, which makes "vs MF" the most readable baseline.
+REFERENCE_POSITION = "MF"
 _ENCODER_CATEGORIES = [REFERENCE_POSITION] + [p for p in POSITIONS if p != REFERENCE_POSITION]
 
 #: Minimum 90s used as a per-90 denominator, so a 12-minute cameo with one goal
@@ -62,7 +80,7 @@ _COLUMN_RANGES = {
     "age": AGE_RANGE,
     "goals": GOALS_RANGE,
     "assists": ASSISTS_RANGE,
-    "minutes": MINUTES_RANGE,
+    "minutes_played": MINUTES_RANGE,
 }
 
 
@@ -74,7 +92,7 @@ def clean_players(frame: pd.DataFrame, require_target: bool = True) -> pd.DataFr
 
     Args:
         frame: Raw output of :mod:`src.data_loader`.
-        require_target: Drop rows without a usable market value.  Set to
+        require_target: Drop rows without a usable market value. Set to
             ``False`` when cleaning a single row for inference.
 
     Returns:
@@ -82,10 +100,12 @@ def clean_players(frame: pd.DataFrame, require_target: bool = True) -> pd.DataFr
     """
     data = frame.copy()
 
-    if "name" in data.columns:
-        data["name"] = data["name"].astype(str).str.strip()
+    if "player_name" in data.columns:
+        data["player_name"] = data["player_name"].astype(str).str.strip()
         before = len(data)
-        data = data[data["name"].str.len() > 0].drop_duplicates(subset=["name"], keep="first")
+        data = data[data["player_name"].str.len() > 0].drop_duplicates(
+            subset=["player_name"], keep="first"
+        )
         if before != len(data):
             LOGGER.info("Dropped %d blank/duplicate player rows", before - len(data))
 
@@ -94,7 +114,7 @@ def clean_players(frame: pd.DataFrame, require_target: bool = True) -> pd.DataFr
         data["position"] = "MF"
     data["position"] = data["position"].map(normalise_position).astype("string")
 
-    # Numerics: coerce, then fill.  Age falls back to the squad median because
+    # Numerics: coerce, then fill. Age falls back to the squad median because
     # a zero would be nonsense; counting stats legitimately default to zero.
     for column in RAW_NUMERIC_FEATURES:
         if column not in data.columns:
@@ -106,7 +126,7 @@ def clean_players(frame: pd.DataFrame, require_target: bool = True) -> pd.DataFr
     else:
         data["age"] = data["age"].fillna(float(np.mean(AGE_RANGE)))
 
-    for column in ("goals", "assists", "minutes"):
+    for column in ("goals", "assists", "minutes_played"):
         missing = int(data[column].isna().sum())
         if missing:
             LOGGER.info("Filling %d missing '%s' values with 0", missing, column)
@@ -128,6 +148,8 @@ def clean_players(frame: pd.DataFrame, require_target: bool = True) -> pd.DataFr
         data = data[data[TARGET].notna() & (data[TARGET] > 0)]
         if before != len(data):
             LOGGER.info("Dropped %d rows without a positive market value", before - len(data))
+        # Keep the euro-denominated column consistent with any coercion above.
+        data[TARGET_EUR] = (data[TARGET] * 1_000_000).round().astype("int64")
 
     return data.reset_index(drop=True)
 
@@ -145,7 +167,7 @@ def engineer_features(frame: pd.DataFrame) -> pd.DataFrame:
       transfer market actually pays for.
     """
     data = frame.copy()
-    nineties = np.maximum(data["minutes"].to_numpy(dtype=float) / 90.0, MIN_NINETIES)
+    nineties = np.maximum(data["minutes_played"].to_numpy(dtype=float) / 90.0, MIN_NINETIES)
 
     data["goals_per_90"] = data["goals"].to_numpy(dtype=float) / nineties
     data["assists_per_90"] = data["assists"].to_numpy(dtype=float) / nineties
@@ -162,7 +184,7 @@ def make_player_frame(
     age: float,
     goals: float,
     assists: float,
-    minutes: float,
+    minutes_played: float,
     position: str,
 ) -> pd.DataFrame:
     """Build a single-row, fully engineered feature frame for inference.
@@ -173,11 +195,11 @@ def make_player_frame(
     row = pd.DataFrame(
         [
             {
-                "name": "input",
+                "player_name": "input",
                 "age": age,
                 "goals": goals,
                 "assists": assists,
-                "minutes": minutes,
+                "minutes_played": minutes_played,
                 "position": normalise_position(position),
             }
         ]
@@ -191,7 +213,7 @@ def make_player_frame(
 def build_preprocessor() -> ColumnTransformer:
     """Standardise numerics and one-hot encode position.
 
-    Scaling matters here beyond convergence: with every numeric feature on a
+    Scaling matters here beyond conditioning: with every numeric feature on a
     unit scale the regression coefficients become directly comparable, which is
     what the dashboard's "Feature Impact" chart reads off.
     """
@@ -236,11 +258,7 @@ def split_dataset(
             LOGGER.info("Skipping stratification - not enough players per position")
 
     return train_test_split(
-        features,
-        target,
-        test_size=test_size,
-        random_state=random_state,
-        stratify=stratify,
+        features, target, test_size=test_size, random_state=random_state, stratify=stratify
     )
 
 
@@ -250,7 +268,7 @@ def humanise_feature_names(names: Sequence[str]) -> list[str]:
         "age": "Age",
         "goals": "Goals",
         "assists": "Assists",
-        "minutes": "Minutes played",
+        "minutes_played": "Minutes played",
         "goals_per_90": "Goals per 90",
         "assists_per_90": "Assists per 90",
         "years_from_peak_sq": f"Age distance from {PEAK_AGE:g} (squared)",

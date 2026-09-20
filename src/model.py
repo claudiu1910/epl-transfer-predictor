@@ -17,6 +17,7 @@ from typing import Any, Mapping
 import joblib
 import numpy as np
 import pandas as pd
+from sklearn.compose import TransformedTargetRegressor
 from sklearn.linear_model import LinearRegression
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from sklearn.model_selection import KFold, cross_val_score
@@ -45,13 +46,38 @@ REGRESSOR_STEP = "regressor"
 # Build & train
 # --------------------------------------------------------------------------- #
 def build_pipeline() -> Pipeline:
-    """Preprocessing + ordinary least squares, as one estimator."""
+    """Preprocessing + ordinary least squares on a log-transformed target.
+
+    Market values are strongly right-skewed (EUR 1.5M to EUR 180M here, skew
+    1.9), which a plain OLS fit handles badly: it chases the handful of
+    superstars and can extrapolate to negative fees for fringe players.
+    Regressing on ``log1p(value)`` makes the model *multiplicative* - each
+    feature scales value by a factor rather than adding a fixed number of
+    millions - which is how the transfer market actually behaves. It also
+    keeps predictions positive and improves cross-validated R^2.
+
+    ``TransformedTargetRegressor`` applies ``expm1`` on the way out, so
+    ``predict`` still returns EUR millions and callers see no difference.
+    """
     return Pipeline(
         steps=[
             (PREPROCESSOR_STEP, build_preprocessor()),
-            (REGRESSOR_STEP, LinearRegression()),
+            (
+                REGRESSOR_STEP,
+                TransformedTargetRegressor(
+                    regressor=LinearRegression(),
+                    func=np.log1p,
+                    inverse_func=np.expm1,
+                ),
+            ),
         ]
     )
+
+
+def _linear_model(pipeline: Pipeline) -> LinearRegression:
+    """Reach the underlying OLS estimator through the target transformer."""
+    regressor = pipeline.named_steps[REGRESSOR_STEP]
+    return getattr(regressor, "regressor_", regressor)
 
 
 def train_model(X_train: pd.DataFrame, y_train: pd.Series) -> Pipeline:
@@ -108,15 +134,17 @@ def cross_validate_r2(
 def get_coefficients(pipeline: Pipeline) -> pd.DataFrame:
     """Extract standardised regression coefficients, largest effect first.
 
-    Because numeric features were standardised, the magnitudes are directly
-    comparable: each value is the change in predicted value (EUR millions) for
-    a one-standard-deviation move in that feature.
+    Numeric features are standardised, so magnitudes are directly comparable.
+    Because the model fits ``log1p(value)``, a coefficient is a *multiplicative*
+    effect: ``exp(coef)`` is the factor a one-standard-deviation increase
+    applies to the prediction. ``pct_per_sd`` expresses that as a percentage,
+    which is what the dashboard plots.
     """
     preprocessor = pipeline.named_steps[PREPROCESSOR_STEP]
-    regressor = pipeline.named_steps[REGRESSOR_STEP]
+    linear = _linear_model(pipeline)
 
     raw_names = list(preprocessor.get_feature_names_out())
-    coefficients = np.asarray(regressor.coef_, dtype=float).ravel()
+    coefficients = np.asarray(linear.coef_, dtype=float).ravel()
 
     frame = pd.DataFrame(
         {
@@ -125,12 +153,15 @@ def get_coefficients(pipeline: Pipeline) -> pd.DataFrame:
             "coefficient": coefficients,
         }
     )
+    frame["multiplier_per_sd"] = np.exp(frame["coefficient"])
+    frame["pct_per_sd"] = (frame["multiplier_per_sd"] - 1.0) * 100.0
     frame["abs_coefficient"] = frame["coefficient"].abs()
     return frame.sort_values("abs_coefficient", ascending=False).reset_index(drop=True)
 
 
 def get_intercept(pipeline: Pipeline) -> float:
-    return float(pipeline.named_steps[REGRESSOR_STEP].intercept_)
+    """Baseline prediction in EUR millions: an average player at the reference position."""
+    return float(np.expm1(_linear_model(pipeline).intercept_))
 
 
 # --------------------------------------------------------------------------- #
@@ -141,7 +172,7 @@ def predict_value(
     age: float,
     goals: float,
     assists: float,
-    minutes: float,
+    minutes_played: float,
     position: str,
     clip_negative: bool = True,
 ) -> float:
@@ -153,9 +184,43 @@ def predict_value(
     result at zero; pass ``False`` to see the raw fit, which is how the
     dashboard detects that a prediction was clipped and says so.
     """
-    features = make_player_frame(age, goals, assists, minutes, position)
+    features = make_player_frame(age, goals, assists, minutes_played, position)
     prediction = float(pipeline.predict(features)[0])
     return max(prediction, 0.0) if clip_negative else prediction
+
+
+def predict_frame(pipeline: Pipeline, frame: pd.DataFrame, clip_negative: bool = True) -> np.ndarray:
+    """Predict values (EUR millions) for a whole player frame at once.
+
+    The scout table needs a prediction for every player in the league; doing
+    that as one vectorised call rather than a row-by-row loop keeps the
+    dashboard responsive.
+    """
+    features = frame[list(FEATURE_COLUMNS)]
+    predictions = np.asarray(pipeline.predict(features), dtype=float)
+    return np.maximum(predictions, 0.0) if clip_negative else predictions
+
+
+def scout_table(pipeline: Pipeline, dataset: pd.DataFrame) -> pd.DataFrame:
+    """Build the league-wide valuation comparison.
+
+    Returns one row per player with their actual value, the model's prediction
+    and the gap between them::
+
+        delta = actual market value - model prediction
+
+    A **positive** delta means the market prices the player above what their
+    output justifies (overvalued). A **negative** delta means the model sees
+    more value than the market is charging - a scout's bargain.
+    """
+    table = dataset.copy()
+    table["predicted_value_eur_m"] = predict_frame(pipeline, table)
+    table["delta_eur_m"] = table[TARGET] - table["predicted_value_eur_m"]
+    # Percentage keeps a EUR 2M gap on a EUR 4M player from being dwarfed by a
+    # EUR 10M gap on a EUR 150M player.
+    table["delta_pct"] = 100.0 * table["delta_eur_m"] / table[TARGET].replace(0, np.nan)
+    table["verdict"] = np.where(table["delta_eur_m"] > 0, "Overvalued", "Undervalued")
+    return table
 
 
 # --------------------------------------------------------------------------- #

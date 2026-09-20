@@ -1,22 +1,24 @@
-"""Data ingestion for the EPL transfer-value predictor.
+"""Data ingestion for the EPL scouting and transfer-valuation dashboard.
 
-Two interchangeable sources feed the same tidy DataFrame contract:
+Three interchangeable sources feed one tidy DataFrame contract:
 
-1. ``football-data.org`` v4 (live).  The free tier exposes squad lists
-   (``/competitions/{code}/teams``) and scoring statistics
-   (``/competitions/{code}/scorers``).  Both are pulled through a shared
-   rate-limited client that respects the 10-requests-per-minute quota.
-2. A deterministic mock generator, so the whole pipeline (training,
-   evaluation, dashboard) can be exercised without an API key.
+1. **reference** (default) - a curated 2024/25 Premier League dataset shipped
+   with the repo (:mod:`src.reference_data`). Real players, real clubs, and
+   approximate stats and valuations, so the dashboard is immediately usable
+   offline with recognisable names.
+2. **api** - live statistics from ``football-data.org`` v4, rate-limited to the
+   free tier's 10 requests/minute. The API tracks match events rather than
+   transfer fees, so valuations are joined in from a CSV.
+3. **mock** - a deterministic synthetic generator, useful for testing the
+   pipeline without real names attached.
 
-Either way the returned frame carries these columns::
+Every source returns the same columns::
 
-    name, team, position, age, goals, assists, minutes, matches
+    player_name, team, position, age, minutes_played, goals, assists, matches
 
-``football-data.org`` tracks match events rather than transfer fees, so the
-target variable is attached separately by :func:`attach_market_values`, which
-supports joining a local CSV of real market values *or* deriving a realistic
-synthetic valuation baseline.
+and :func:`load_dataset` attaches the target, ``actual_market_value_eur``
+(plus ``market_value_eur_m``, the same figure in millions, which is what the
+model is trained on).
 """
 
 from __future__ import annotations
@@ -27,11 +29,13 @@ import threading
 import time
 from collections import deque
 from pathlib import Path
-from typing import Any, Iterable, Literal, Sequence
+from typing import Any, Iterable, Literal
 
 import numpy as np
 import pandas as pd
 import requests
+
+from .reference_data import EPL_SQUADS, PROVENANCE, SEASON, SQUAD_FIELDS
 
 LOGGER = logging.getLogger(__name__)
 
@@ -48,27 +52,35 @@ FREE_TIER_WINDOW_SECONDS = 60.0
 
 POSITIONS: tuple[str, ...] = ("GK", "DF", "MF", "FW")
 
-#: Canonical column contract produced by every loader in this module.
+#: Canonical feature columns produced by every loader in this module.
 PLAYER_COLUMNS: tuple[str, ...] = (
-    "name",
+    "player_name",
     "team",
     "position",
     "age",
+    "minutes_played",
     "goals",
     "assists",
-    "minutes",
     "matches",
 )
 
+#: Target in full euros (the column the dashboard displays).
+TARGET_EUR = "actual_market_value_eur"
+#: Same figure in millions - what the model actually regresses on.
+TARGET_EUR_M = "market_value_eur_m"
+
+#: Where :func:`build_reference_dataset` writes the curated CSV.
+REFERENCE_DATASET_PATH = Path("data/raw/epl_players_2024_25.csv")
+
 # The API does not publish per-player minutes on the free tier, so minutes are
-# estimated from appearances.  Kept explicit (and documented in the README) so
+# estimated from appearances. Kept explicit (and documented in the README) so
 # the assumption is never mistaken for a measured value.
 MINUTES_PER_APPEARANCE_ESTIMATE = 78.0
 MAX_SEASON_MINUTES = 3420  # 38 matches x 90 minutes
 
-# Slider domains used by the dashboard; loaders clip to the same ranges so the
-# training distribution and the UI can never drift apart.
-AGE_RANGE = (17, 38)
+# Input domains. Loaders clip to these so the training distribution and the
+# dashboard's what-if sliders can never drift apart.
+AGE_RANGE = (17, 40)
 GOALS_RANGE = (0, 40)
 ASSISTS_RANGE = (0, 25)
 MINUTES_RANGE = (0, MAX_SEASON_MINUTES)
@@ -146,8 +158,8 @@ class FootballDataClient:
         if not self.api_key:
             raise MissingAPIKeyError(
                 f"No API key found. Set the {API_KEY_ENV_VAR} environment variable "
-                "(free key: https://www.football-data.org/client/register) or run in "
-                "mock mode with `python train.py --mode mock`."
+                "(free key: https://www.football-data.org/client/register) or use the "
+                "bundled dataset with `python train.py --mode reference`."
             )
 
         self.base_url = base_url.rstrip("/")
@@ -268,8 +280,8 @@ def age_from_date_of_birth(dob: Any, on: pd.Timestamp | None = None) -> float | 
     return float(years)
 
 
-def _normalise_name(series: pd.Series) -> pd.Series:
-    """Lower-cased, accent-stripped key used for CSV joins.
+def normalise_name(series: pd.Series) -> pd.Series:
+    """Lower-cased, accent-stripped key used for joining player names.
 
     Digits are deliberately kept: they are the only thing separating players
     who would otherwise share a key ("Danny Ward" appears twice in a typical
@@ -293,6 +305,53 @@ def _empty_players_frame() -> pd.DataFrame:
 
 
 # --------------------------------------------------------------------------- #
+# Reference dataset (default source)
+# --------------------------------------------------------------------------- #
+def build_reference_dataset(path: str | Path = REFERENCE_DATASET_PATH) -> Path:
+    """Write the curated squad table in :mod:`src.reference_data` to CSV.
+
+    Called automatically when the CSV is missing, so a fresh clone is one
+    ``train.py`` away from a working dashboard.
+    """
+    frame = pd.DataFrame(list(EPL_SQUADS), columns=list(SQUAD_FIELDS))
+    frame["matches"] = np.round(frame["minutes_played"] / MINUTES_PER_APPEARANCE_ESTIMATE).astype(int)
+    frame[TARGET_EUR] = (frame.pop(TARGET_EUR_M) * 1_000_000).astype("int64")
+    frame["season"] = SEASON
+    frame["value_source"] = "reference"
+
+    destination = Path(path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    frame.to_csv(destination, index=False)
+    LOGGER.info("Wrote %d reference players to %s", len(frame), destination)
+    return destination
+
+
+def load_reference_dataset(
+    path: str | Path = REFERENCE_DATASET_PATH, rebuild: bool = False
+) -> pd.DataFrame:
+    """Load the curated dataset, generating the CSV first if it is absent.
+
+    The CSV is the editable surface: correct a value there and it survives
+    the next run. Pass ``rebuild=True`` to overwrite it from the Python table.
+    """
+    destination = Path(path)
+    if rebuild or not destination.exists():
+        build_reference_dataset(destination)
+
+    frame = pd.read_csv(destination)
+    missing = [c for c in (*PLAYER_COLUMNS, TARGET_EUR) if c not in frame.columns]
+    if missing:
+        raise ValueError(
+            f"{destination} is missing required columns: {missing}. "
+            "Delete the file to regenerate it, or fix the header."
+        )
+
+    frame["position"] = frame["position"].map(normalise_position)
+    LOGGER.info("Loaded %d reference players from %s", len(frame), destination)
+    return frame
+
+
+# --------------------------------------------------------------------------- #
 # Live API loaders
 # --------------------------------------------------------------------------- #
 def squads_to_frame(teams: Iterable[dict[str, Any]]) -> pd.DataFrame:
@@ -304,7 +363,7 @@ def squads_to_frame(teams: Iterable[dict[str, Any]]) -> pd.DataFrame:
             rows.append(
                 {
                     "player_id": player.get("id"),
-                    "name": player.get("name"),
+                    "player_name": player.get("name"),
                     "team": team_name,
                     "position": normalise_position(player.get("position")),
                     "age": age_from_date_of_birth(player.get("dateOfBirth")),
@@ -324,7 +383,7 @@ def scorers_to_frame(scorers: Iterable[dict[str, Any]]) -> pd.DataFrame:
         rows.append(
             {
                 "player_id": player.get("id"),
-                "name": player.get("name"),
+                "player_name": player.get("name"),
                 "team": team.get("shortName") or team.get("name"),
                 "position": normalise_position(player.get("position") or player.get("section")),
                 "age": age_from_date_of_birth(player.get("dateOfBirth")),
@@ -332,7 +391,7 @@ def scorers_to_frame(scorers: Iterable[dict[str, Any]]) -> pd.DataFrame:
                 "assists": entry.get("assists") or 0,
                 "matches": matches,
                 # Free tier has no minutes field - estimate from appearances.
-                "minutes": round(matches * MINUTES_PER_APPEARANCE_ESTIMATE),
+                "minutes_played": round(matches * MINUTES_PER_APPEARANCE_ESTIMATE),
             }
         )
     return pd.DataFrame(rows)
@@ -355,7 +414,7 @@ def fetch_epl_players(
         scorer_limit: How many rows to request from the scorers endpoint.
         include_non_scorers: Also keep squad members with no scoring record.
             Their goals/assists/minutes are zeroed, which is truthful but
-            heavily inflates the number of zero-value rows, so it is off by
+            heavily inflates the number of zero-output rows, so it is off by
             default.
         client: Pre-built client, mainly for testing.
 
@@ -377,30 +436,23 @@ def fetch_epl_players(
     # the squad *and* keeps scorers missing from the squad lists (loanees, players
     # who moved mid-season), which a left join would silently drop.
     how: Literal["outer", "right"] = "outer" if include_non_scorers else "right"
-    merged = squads.merge(
-        scorers,
-        on="player_id",
-        how=how,
-        suffixes=("", "_scorer"),
-    )
+    merged = squads.merge(scorers, on="player_id", how=how, suffixes=("", "_scorer"))
 
     # Squad payload is the better source for name/position/age; fall back to
     # whatever the scorers endpoint returned.
-    for column in ("name", "team", "position", "age"):
+    for column in ("player_name", "team", "position", "age"):
         fallback = f"{column}_scorer"
         if fallback in merged.columns:
             merged[column] = merged[column].combine_first(merged[fallback])
 
-    for column, default in (("goals", 0), ("assists", 0), ("matches", 0), ("minutes", 0)):
+    for column, default in (("goals", 0), ("assists", 0), ("matches", 0), ("minutes_played", 0)):
         if column not in merged.columns:
             merged[column] = default
         # Squad members with no scoring record genuinely have zero output.
-        merged[column] = (
-            pd.to_numeric(merged[column], errors="coerce").fillna(default).astype(int)
-        )
+        merged[column] = pd.to_numeric(merged[column], errors="coerce").fillna(default).astype(int)
 
     merged["position"] = merged["position"].map(normalise_position)
-    merged = merged.dropna(subset=["name"])
+    merged = merged.dropna(subset=["player_name"])
 
     LOGGER.info("Fetched %d players from the API", len(merged))
     return merged[list(PLAYER_COLUMNS)].reset_index(drop=True)
@@ -409,12 +461,7 @@ def fetch_epl_players(
 # --------------------------------------------------------------------------- #
 # Mock / offline generator
 # --------------------------------------------------------------------------- #
-_MOCK_TEAMS = (
-    "Arsenal", "Aston Villa", "Bournemouth", "Brentford", "Brighton",
-    "Chelsea", "Crystal Palace", "Everton", "Fulham", "Ipswich",
-    "Leicester", "Liverpool", "Man City", "Man United", "Newcastle",
-    "Nottingham Forest", "Southampton", "Tottenham", "West Ham", "Wolves",
-)
+_MOCK_TEAMS = tuple(sorted({row[1] for row in EPL_SQUADS}))
 _MOCK_FIRST_NAMES = (
     "Alex", "Bruno", "Callum", "Diego", "Emile", "Finn", "Gabriel", "Harvey",
     "Ivan", "Jonas", "Kai", "Luka", "Mateo", "Noah", "Omar", "Pedro",
@@ -433,12 +480,13 @@ _MOCK_ASSIST_RATE = {"GK": 0.004, "DF": 0.045, "MF": 0.130, "FW": 0.180}
 
 
 def generate_mock_players(n_players: int = 320, seed: int | None = 42) -> pd.DataFrame:
-    """Generate a realistic offline stand-in for a season of EPL player data.
+    """Generate a synthetic stand-in for a season of EPL player data.
 
     Statistics are drawn from position-aware distributions (forwards score,
     goalkeepers do not; minutes follow a skewed starter/squad-player split) so
     the downstream model sees the same kinds of correlations it would meet in
-    the live feed.
+    the real feed. Names are fictional - use ``mode="reference"`` when you want
+    real players.
     """
     rng = np.random.default_rng(seed)
 
@@ -461,21 +509,20 @@ def generate_mock_players(n_players: int = 320, seed: int | None = 42) -> pd.Dat
 
     first = rng.choice(_MOCK_FIRST_NAMES, size=n_players)
     last = rng.choice(_MOCK_LAST_NAMES, size=n_players)
-    names = [f"{f} {l}" for f, l in zip(first, last)]
+    names = pd.Series([f"{f} {l}" for f, l in zip(first, last)])
     # Disambiguate the inevitable duplicates from a small name pool.
-    names = pd.Series(names)
     duplicated = names.duplicated(keep=False)
     names[duplicated] = names[duplicated] + " " + (names.groupby(names).cumcount() + 1).astype(str)
 
     frame = pd.DataFrame(
         {
-            "name": names.to_numpy(),
+            "player_name": names.to_numpy(),
             "team": rng.choice(_MOCK_TEAMS, size=n_players),
             "position": positions,
             "age": ages.astype(int),
+            "minutes_played": minutes.astype(int),
             "goals": goals.astype(int),
             "assists": assists.astype(int),
-            "minutes": minutes.astype(int),
             "matches": matches,
         }
     )
@@ -499,22 +546,21 @@ def synthesise_market_values(
     seed: int | None = 7,
     noise_sigma: float = 0.17,
 ) -> pd.Series:
-    """Derive a realistic synthetic transfer valuation, in EUR millions.
+    """Derive a synthetic transfer valuation, in EUR millions.
 
     The baseline is deliberately *multiplicative* - value compounds across a
     bell-shaped age curve, a position premium, playing time and output - which
     mirrors how the transfer market actually behaves and keeps the task
     non-trivial for a linear model.
 
-    This is a documented stand-in, not a market quote: use
-    ``--market-values path/to/values.csv`` to train on real fees.
+    Only used in mock mode, or to fill gaps a market-value CSV does not cover.
     """
     rng = np.random.default_rng(seed)
 
     age = frame["age"].to_numpy(dtype=float)
     goals = frame["goals"].to_numpy(dtype=float)
     assists = frame["assists"].to_numpy(dtype=float)
-    minutes = frame["minutes"].to_numpy(dtype=float)
+    minutes = frame["minutes_played"].to_numpy(dtype=float)
     positions = frame["position"].astype(str).to_numpy()
 
     # Bell curve peaking in the mid-twenties, tapering towards both ends.
@@ -528,22 +574,17 @@ def synthesise_market_values(
     noise = rng.lognormal(mean=0.0, sigma=noise_sigma, size=len(frame))
 
     values = (
-        BASE_VALUE_EUR_M
-        * age_factor
-        * availability_factor
-        * output_factor
-        * position_factor
-        * noise
+        BASE_VALUE_EUR_M * age_factor * availability_factor * output_factor * position_factor * noise
     )
     return pd.Series(np.round(np.maximum(values, MIN_VALUE_EUR_M), 2), index=frame.index)
 
 
 def load_market_values_csv(csv_path: str | Path, value_column: str | None = None) -> pd.DataFrame:
-    """Read a local market-value CSV into ``name`` / ``market_value_eur_m``.
+    """Read a local market-value CSV into ``player_name`` / ``market_value_eur_m``.
 
-    The file needs a player-name column (``name``, ``player`` or ``player_name``)
-    and a value column.  Values are interpreted as EUR millions unless the
-    column name mentions plain euros, in which case they are scaled down.
+    The file needs a player-name column (``player_name``, ``name`` or ``player``)
+    and a value column. Values are interpreted as EUR millions unless they look
+    like raw euro amounts, in which case they are scaled down.
     """
     path = Path(csv_path)
     if not path.exists():
@@ -552,15 +593,18 @@ def load_market_values_csv(csv_path: str | Path, value_column: str | None = None
     table = pd.read_csv(path)
     lower = {c.lower().strip(): c for c in table.columns}
 
-    name_col = next((lower[c] for c in ("name", "player", "player_name", "full_name") if c in lower), None)
+    name_col = next(
+        (lower[c] for c in ("player_name", "name", "player", "full_name") if c in lower), None
+    )
     if name_col is None:
-        raise ValueError(f"{path} needs a player name column (name / player / player_name)")
+        raise ValueError(f"{path} needs a player name column (player_name / name / player)")
 
     if value_column is None:
         value_column = next(
             (
                 lower[c]
                 for c in (
+                    "actual_market_value_eur",
                     "market_value_eur_m",
                     "market_value_m",
                     "market_value",
@@ -573,7 +617,7 @@ def load_market_values_csv(csv_path: str | Path, value_column: str | None = None
             None,
         )
     if value_column is None:
-        raise ValueError(f"{path} needs a market value column (e.g. market_value_eur_m)")
+        raise ValueError(f"{path} needs a market value column (e.g. actual_market_value_eur)")
 
     values = pd.to_numeric(
         table[value_column].astype(str).str.replace(r"[^0-9eE.\-+]", "", regex=True),
@@ -583,8 +627,10 @@ def load_market_values_csv(csv_path: str | Path, value_column: str | None = None
     if values.dropna().median() > 10_000:
         values = values / 1_000_000.0
 
-    out = pd.DataFrame({"name": table[name_col].astype(str), "market_value_eur_m": values})
-    return out.dropna(subset=["market_value_eur_m"]).drop_duplicates(subset=["name"])
+    out = pd.DataFrame(
+        {"player_name": table[name_col].astype(str), TARGET_EUR_M: values}
+    )
+    return out.dropna(subset=[TARGET_EUR_M]).drop_duplicates(subset=["player_name"])
 
 
 def attach_market_values(
@@ -593,10 +639,10 @@ def attach_market_values(
     on_missing: Literal["drop", "synthesise"] = "drop",
     seed: int | None = 7,
 ) -> pd.DataFrame:
-    """Attach the ``market_value_eur_m`` target column.
+    """Attach the target columns to a player frame.
 
     With ``market_value_csv`` the values are joined on a normalised player
-    name; without it a synthetic baseline is generated.  ``on_missing``
+    name; without it a synthetic baseline is generated. ``on_missing``
     controls what happens to players the CSV does not cover - dropping them
     (default) keeps the training set purely real, while ``synthesise`` fills
     the gaps with the baseline and flags the rows in ``value_source``.
@@ -604,13 +650,13 @@ def attach_market_values(
     result = frame.copy()
 
     if market_value_csv is None:
-        result["market_value_eur_m"] = synthesise_market_values(result, seed=seed)
+        result[TARGET_EUR_M] = synthesise_market_values(result, seed=seed)
         result["value_source"] = "synthetic"
-        return result
+        return _finalise_target(result)
 
     values = load_market_values_csv(market_value_csv)
-    values["_join_key"] = _normalise_name(values["name"])
-    result["_join_key"] = _normalise_name(result["name"])
+    values["_join_key"] = normalise_name(values["player_name"])
+    result["_join_key"] = normalise_name(result["player_name"])
 
     # Two CSV rows sharing a normalised key would multiply the player rows, so
     # collapse them first and let pandas assert the join stays many-to-one.
@@ -624,12 +670,9 @@ def attach_market_values(
         values = values.drop_duplicates(subset=["_join_key"], keep="first")
 
     result = result.merge(
-        values[["_join_key", "market_value_eur_m"]],
-        on="_join_key",
-        how="left",
-        validate="m:1",
+        values[["_join_key", TARGET_EUR_M]], on="_join_key", how="left", validate="m:1"
     )
-    matched = result["market_value_eur_m"].notna()
+    matched = result[TARGET_EUR_M].notna()
     LOGGER.info(
         "Matched %d/%d players against %s", int(matched.sum()), len(result), market_value_csv
     )
@@ -638,21 +681,31 @@ def attach_market_values(
     if on_missing == "synthesise":
         gaps = ~matched
         if gaps.any():
-            filled = synthesise_market_values(result.loc[gaps], seed=seed)
-            result.loc[gaps, "market_value_eur_m"] = filled
+            result.loc[gaps, TARGET_EUR_M] = synthesise_market_values(result.loc[gaps], seed=seed)
             result.loc[gaps, "value_source"] = "synthetic"
     else:
         result = result[matched]
 
-    return result.drop(columns=["_join_key"]).reset_index(drop=True)
+    return _finalise_target(result.drop(columns=["_join_key"]).reset_index(drop=True))
+
+
+def _finalise_target(frame: pd.DataFrame) -> pd.DataFrame:
+    """Derive ``actual_market_value_eur`` from the millions column."""
+    result = frame.copy()
+    result[TARGET_EUR] = (result[TARGET_EUR_M].astype(float) * 1_000_000).round().astype("int64")
+    return result
 
 
 # --------------------------------------------------------------------------- #
 # Top-level entry point
 # --------------------------------------------------------------------------- #
+Mode = Literal["auto", "reference", "api", "mock"]
+
+
 def load_dataset(
-    mode: Literal["auto", "api", "mock"] = "auto",
+    mode: Mode = "auto",
     market_value_csv: str | Path | None = None,
+    reference_path: str | Path = REFERENCE_DATASET_PATH,
     n_mock: int = 320,
     seed: int | None = 42,
     api_key: str | None = None,
@@ -660,35 +713,53 @@ def load_dataset(
     include_non_scorers: bool = False,
     on_missing: Literal["drop", "synthesise"] = "drop",
 ) -> pd.DataFrame:
-    """Load features + target in one call.
+    """Load features and target in one call.
 
-    ``mode="auto"`` uses the live API when ``FOOTBALL_DATA_API_KEY`` is set and
-    transparently falls back to the mock generator otherwise, so a fresh clone
-    can train and launch the dashboard with zero configuration.
+    Modes:
+        ``reference`` - the bundled 2024/25 dataset of real players (default).
+        ``api``       - live football-data.org statistics; valuations come from
+                        ``market_value_csv``, falling back to the reference CSV
+                        because no free API publishes transfer fees.
+        ``mock``      - synthetic players and synthetic valuations.
+        ``auto``      - resolves to ``reference``.
     """
-    resolved = mode
+    resolved: str = "reference" if mode == "auto" else mode
     if mode == "auto":
-        resolved = "api" if (api_key or os.getenv(API_KEY_ENV_VAR)) else "mock"
-        LOGGER.info("mode=auto resolved to '%s'", resolved)
+        LOGGER.info("mode=auto resolved to 'reference'")
+
+    if resolved == "reference":
+        dataset = load_reference_dataset(reference_path)
+        if market_value_csv is not None:
+            # An explicit CSV overrides the bundled valuations.
+            dataset = attach_market_values(
+                dataset.drop(columns=[TARGET_EUR, TARGET_EUR_M], errors="ignore"),
+                market_value_csv=market_value_csv,
+                on_missing=on_missing,
+                seed=seed,
+            )
+        else:
+            dataset[TARGET_EUR_M] = dataset[TARGET_EUR].astype(float) / 1_000_000.0
+            dataset["value_source"] = dataset.get("value_source", "reference")
+        dataset.attrs["source"] = "reference"
+        return dataset
 
     if resolved == "api":
-        try:
-            players = fetch_epl_players(
-                api_key=api_key,
-                scorer_limit=scorer_limit,
-                include_non_scorers=include_non_scorers,
-            )
-        except (MissingAPIKeyError, requests.RequestException, RuntimeError) as exc:
-            if mode == "api":  # explicit request - do not silently degrade
-                raise
-            LOGGER.warning("API load failed (%s); falling back to mock data", exc)
-            players = generate_mock_players(n_players=n_mock, seed=seed)
-    else:
+        players = fetch_epl_players(
+            api_key=api_key, scorer_limit=scorer_limit, include_non_scorers=include_non_scorers
+        )
+        # The API has no transfer fees, so fall back to the bundled valuations.
+        values_csv = market_value_csv
+        if values_csv is None:
+            values_csv = Path(reference_path)
+            if not values_csv.exists():
+                build_reference_dataset(values_csv)
+            LOGGER.info("No --market-values given; joining valuations from %s", values_csv)
+    else:  # mock
         players = generate_mock_players(n_players=n_mock, seed=seed)
+        values_csv = market_value_csv
 
-    players.attrs["source"] = resolved
     dataset = attach_market_values(
-        players, market_value_csv=market_value_csv, on_missing=on_missing, seed=seed
+        players, market_value_csv=values_csv, on_missing=on_missing, seed=seed
     )
     dataset.attrs["source"] = resolved
     return dataset

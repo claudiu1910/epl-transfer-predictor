@@ -171,35 +171,48 @@ def plot_coefficients(
 ) -> Figure:
     """Horizontal bar chart of standardised regression coefficients.
 
+    The model fits ``log1p(value)``, so effects are multiplicative. When the
+    ``pct_per_sd`` column is present the chart plots that - "a one-standard-
+    deviation increase changes predicted value by X%" - which reads far better
+    than a raw log coefficient.
+
     Args:
-        coefficients: Output of :func:`src.model.get_coefficients`
-            (``label`` / ``coefficient`` columns, sorted by absolute size).
+        coefficients: Output of :func:`src.model.get_coefficients`.
         top_n: Keep only the ``n`` strongest effects.
     """
     apply_style()
     frame = coefficients.copy()
     if top_n:
         frame = frame.head(top_n)
-    # Largest bar on top once the axis is inverted.
-    frame = frame.sort_values("coefficient")
 
-    colors = [ACCENT if value >= 0 else NEGATIVE for value in frame["coefficient"]]
+    if "pct_per_sd" in frame.columns:
+        column = "pct_per_sd"
+        xlabel = "Change in predicted value per standard deviation (%)"
+        fmt = "{:+.0f}%"
+    else:
+        column = "coefficient"
+        xlabel = "Coefficient (EUR millions per standard deviation)"
+        fmt = "{:+.2f}"
+
+    # Largest bar on top once the axis is inverted.
+    frame = frame.sort_values(column)
+    colors = [ACCENT if value >= 0 else NEGATIVE for value in frame[column]]
 
     fig, ax = plt.subplots(figsize=figsize)
-    bars = ax.barh(frame["label"], frame["coefficient"], color=colors, edgecolor="white")
+    bars = ax.barh(frame["label"], frame[column], color=colors, edgecolor="white")
     ax.axvline(0.0, color=INK, linewidth=1.0)
-    ax.set_xlabel("Coefficient (EUR millions per standard deviation)")
+    ax.set_xlabel(xlabel)
     ax.set_ylabel("")
     ax.set_title(title)
 
     # Value labels sit just outside each bar.
-    span = float(frame["coefficient"].abs().max() or 1.0)
-    for bar, value in zip(bars, frame["coefficient"]):
+    span = float(frame[column].abs().max() or 1.0)
+    for bar, value in zip(bars, frame[column]):
         offset = 0.02 * span * (1 if value >= 0 else -1)
         ax.text(
             value + offset,
             bar.get_y() + bar.get_height() / 2,
-            f"{value:+.2f}",
+            fmt.format(value),
             va="center",
             ha="left" if value >= 0 else "right",
             fontsize=9,
