@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# Environments
+.venv/
+venv/
+env/
+.env
+
+# Trained artefacts and data snapshots are reproducible from train.py
+models/*.pkl
+models/*.json
+data/raw/*.csv
+data/processed/*.csv
+reports/*.png
+
+# Keep the directory structure and the example files in git
+!data/raw/market_values.example.csv
+!**/.gitkeep
+
+# Tooling / OS
+.streamlit/secrets.toml
+.ipynb_checkpoints/
+.pytest_cache/
+.DS_Store
